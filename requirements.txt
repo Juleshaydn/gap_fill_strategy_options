@@ -1,0 +1,8 @@
+yfinance
+pandas
+matplotlib
+streamlit
+seaborn
+scikit-learn
+nest_asyncio
+openai
