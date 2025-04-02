@@ -6,7 +6,7 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, time
+from datetime import datetime
 from pandas.tseries.offsets import BDay
 
 # For machine learning:
@@ -19,29 +19,45 @@ import math
 from math import log, sqrt, exp
 from scipy.stats import norm
 
-from openai_strategy import generate_option_strategy
+import openai
+import os
+import json
+import time
+import requests
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 
-st.set_page_config(page_title="SPY Gap Fill Backtesting Dashboard", layout="wide")
-st.title("SPY Gap Fill Backtesting Dashboard with Consolidated Metrics, ML, and Automated 0DTE Strategy")
+st.set_page_config(page_title="Gap Fill Backtesting Dashboard", layout="wide")
+st.title("Gap Fill Backtesting Dashboard with Consolidated Metrics, ML, and Automated 0DTE Strategy (Using Uploaded Greeks)")
 
 st.markdown("""
-This dashboard allows you to select a lookback period for SPY historical data. 
-It calculates daily gaps, performs intraday gap fill analysis, and computes various metrics 
-(including market volatility, VIX, trading volume, and market sentiment). All these metrics 
-are consolidated into one daily summary table. A heatmap shows the day-of-week correlation 
-of the historical gap fill probability. An ML model is built to predict next day's metrics 
-(price change, gap fill probability, volume % change, and minutes to fill) based on historical data.
-
-Finally, you can **upload a CSV of the option chain** for a specific 0DTE date. 
-The system will parse the chain, pick a nearest ATM strike, and create an **automated vertical spread** 
-(bullish or bearish) based on the predicted next day metrics. 
-If no valid opportunity is found, it returns **"No Trading Opportunities."**
+This dashboard allows you to select a lookback period and an asset (Apple, Amazon, SPY, Google, Tesla, or Bitcoin). 
+It downloads historical data, calculates daily gaps and other metrics, and builds an ML model to predict next day metrics.  
+Finally, you can upload a CSV of your 0DTE option chain (with pre-computed Greeks) and your custom assistant will return an optimal 
+option order combination as a JSON object (which is then displayed as a table). If no viable opportunity exists, a fallback JSON object with all values as "n/a" is returned.
 """)
 
-# -----------------------------------
+# -------------------------------
+# Asset Selection
+# -------------------------------
+asset_options = {
+    "Apple": "AAPL",
+    "Amazon": "AMZN",
+    "SPY": "SPY",
+    "Google": "GOOG",
+    "Tesla": "TSLA",
+    "Bitcoin": "BTC-USD"
+}
+asset_choice = st.selectbox("Choose Asset", list(asset_options.keys()), index=2)
+ticker_symbol = asset_options[asset_choice]
+st.write(f"**Selected Asset:** {asset_choice} ({ticker_symbol})")
+
+# -------------------------------
 # 1. User Input for Lookback Period
-# -----------------------------------
+# -------------------------------
 period_choice = st.selectbox(
     "Choose Lookback Period",
     ["7d", "14d", "1mo", "3mo", "6mo", "1y"],
@@ -61,27 +77,27 @@ def choose_interval(period):
 interval_choice = choose_interval(period_choice)
 st.write(f"**Selected Period:** {period_choice}, **Interval:** {interval_choice}")
 
-# -----------------------------------
+# -------------------------------
 # 2. Data Download and Preparation
-# -----------------------------------
+# -------------------------------
 @st.cache_data(show_spinner=True)
-def load_data(period, interval):
-    data = yf.download("SPY", period=period, interval=interval, auto_adjust=True)
+def load_data(ticker, period, interval):
+    data = yf.download(ticker, period=period, interval=interval, auto_adjust=True)
     data.columns = data.columns.get_level_values(0)
     return data
 
-spy = load_data(period_choice, interval_choice)
-if spy.empty:
+data = load_data(ticker_symbol, period_choice, interval_choice)
+if data.empty:
     st.error("No data downloaded. Check your network connection or ticker symbol.")
     st.stop()
 
-spy.index = pd.to_datetime(spy.index)
-spy['Date'] = spy.index.date
+data.index = pd.to_datetime(data.index)
+data['Date'] = data.index.date
 
-# -----------------------------------
-# 3. Create Daily Summary for SPY (including Volume)
-# -----------------------------------
-daily_summary = spy.groupby('Date').agg({
+# -------------------------------
+# 3. Create Daily Summary (including Volume)
+# -------------------------------
+daily_summary = data.groupby('Date').agg({
     'Open': 'first',
     'Close': 'last',
     'High': 'max',
@@ -97,9 +113,9 @@ daily_summary.dropna(inplace=True)
 daily_summary['Day_of_Week'] = pd.to_datetime(daily_summary.index).day_name()
 daily_summary['Daily_Volatility'] = (daily_summary['High'] - daily_summary['Open']) / daily_summary['Open'] * 100
 
-# -----------------------------------
+# -------------------------------
 # 4. Download VIX Daily Data for the same date range
-# -----------------------------------
+# -------------------------------
 start_date = daily_summary.index.min().strftime("%Y-%m-%d")
 end_date = daily_summary.index.max().strftime("%Y-%m-%d")
 vix = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
@@ -108,20 +124,19 @@ vix_daily = vix[['Close']].rename(columns={'Close': 'VIX_Close'})
 vix_daily.index = vix_daily.index.date
 daily_summary = daily_summary.merge(vix_daily, left_index=True, right_index=True, how='left')
 
-# -----------------------------------
+# -------------------------------
 # 5. Additional Column: Gap Type
-# -----------------------------------
+# -------------------------------
 def classify_gap(gap_pct):
     return "Small Gap" if abs(gap_pct) <= 1 else "Large Gap"
-
 daily_summary['Gap_Type'] = daily_summary['Gap_Pct'].apply(classify_gap)
 
-# -----------------------------------
+# -------------------------------
 # 6. Intraday Gap Fill Analysis
-# -----------------------------------
+# -------------------------------
 gap_fill_data = []
 for date in daily_summary.index:
-    day_data = spy[spy['Date'] == date]
+    day_data = data[data['Date'] == date]
     if day_data.empty:
         continue
     prev_close = daily_summary.loc[date, 'Prev_Close']
@@ -144,31 +159,30 @@ for date in daily_summary.index:
         'Minutes_to_Fill': minutes_to_fill,
         'Filled': filled
     })
-
 gap_fill_df = pd.DataFrame(gap_fill_data).set_index('Date')
 daily_summary = daily_summary.merge(gap_fill_df, left_index=True, right_index=True, how='left')
 daily_summary['Filled'] = daily_summary['Filled'].fillna(False)
 
-# -----------------------------------
+# -------------------------------
 # 7. Historical Fill Probability (by Day of Week)
-# -----------------------------------
+# -------------------------------
 fill_prob = daily_summary.groupby('Day_of_Week')['Filled'].mean()
 days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 fill_prob = fill_prob.reindex(days_order)
 fill_prob_mapping = fill_prob.to_dict()
 daily_summary['Historical_Fill_Probability'] = daily_summary['Day_of_Week'].map(fill_prob_mapping)
 
-# -----------------------------------
+# -------------------------------
 # 8. Historical Volume Metrics (by Day of Week)
-# -----------------------------------
+# -------------------------------
 grouped_volume = daily_summary.groupby('Day_of_Week')['Volume'].mean()
 grouped_volume_pct = daily_summary.groupby('Day_of_Week')['Volume_Pct_Change'].mean()
 daily_summary['Historical_Avg_Volume'] = daily_summary['Day_of_Week'].map(grouped_volume.to_dict())
 daily_summary['Historical_Avg_Volume_Pct_Change'] = daily_summary['Day_of_Week'].map(grouped_volume_pct.to_dict())
 
-# -----------------------------------
-# 9. Market Sentiment Column (using dummy Economic_Event data)
-# -----------------------------------
+# -------------------------------
+# 9. Market Sentiment Column (dummy Economic_Event data)
+# -------------------------------
 dummy_events = {
     daily_summary.index[0]: "Positive earnings surprise",
     daily_summary.index[1]: "Slightly negative macro report",
@@ -193,9 +207,9 @@ def sentiment_score(event):
         return 0
 daily_summary['Market_Sentiment'] = daily_summary['Economic_Event'].apply(sentiment_score)
 
-# -----------------------------------
+# -------------------------------
 # 10. Consolidated Daily Summary Display
-# -----------------------------------
+# -------------------------------
 final_columns = [
     'Open', 'Close', 'High', 'Low', 'Prev_Close', 'Gap', 'Gap_Pct', 
     'Day_of_Week', 'Daily_Volatility', 'Gap_Type', 'Economic_Event', 
@@ -207,9 +221,9 @@ daily_summary = daily_summary[final_columns]
 st.subheader("Consolidated Daily Summary with Metrics")
 st.dataframe(daily_summary)
 
-# -----------------------------------
+# -------------------------------
 # 11. Correlation: Day of Week vs. Gap Fill Probability Heatmap
-# -----------------------------------
+# -------------------------------
 st.subheader("Gap Fill Probability by Day of Week (Historical)")
 day_prob_df = pd.DataFrame({'Fill_Probability': fill_prob})
 fig2, ax2 = plt.subplots(figsize=(6, 2))
@@ -217,9 +231,9 @@ sns.heatmap(day_prob_df.T, annot=True, cmap='YlGnBu', vmin=0, vmax=1, ax=ax2)
 ax2.set_title("Gap Fill Probability by Day of Week")
 st.pyplot(fig2)
 
-# -----------------------------------
+# -------------------------------
 # 12. Next Day Prediction Section (including Volume Metrics)
-# -----------------------------------
+# -------------------------------
 last_date = pd.to_datetime(daily_summary.index.max())
 next_trading_day = (last_date + BDay(1)).date()
 next_day_name = pd.to_datetime(next_trading_day).day_name()
@@ -240,18 +254,10 @@ if predicted_probability is not None:
 else:
     st.write("Not enough historical data to predict next day's metrics.")
 
-# -----------------------------------
+# -------------------------------
 # 13. Machine Learning Model for Next Day Metrics Prediction
-# -----------------------------------
-st.subheader("Machine Learning: Next Day Metrics Prediction")
-st.markdown("""
-We now build an ML model using historical daily data to predict next day metrics:
-- **Next Day Price Change (%)**: ((next_open - today's close) / today's close * 100)
-- **Next Day Gap Fill Probability** (0 if gap not filled, 1 if filled)
-- **Next Day Volume % Change**
-- **Next Day Minutes to Fill**
-""")
-
+# -------------------------------
+st.subheader("ML Next Day Predictions")
 ml_data = daily_summary.sort_index().copy()
 ml_data['Filled'] = ml_data['Filled'].fillna(False)
 ml_data['next_open'] = ml_data['Open'].shift(-1)
@@ -260,17 +266,14 @@ ml_data['next_volume_pct_change'] = ml_data['Volume_Pct_Change'].shift(-1)
 ml_data['next_minutes_to_fill'] = ml_data['Minutes_to_Fill'].shift(-1)
 ml_data['next_price_change'] = ((ml_data['next_open'] - ml_data['Close']) / ml_data['Close']) * 100
 ml_data = ml_data.dropna(subset=['next_open', 'next_gap_filled', 'next_volume_pct_change', 'next_minutes_to_fill', 'next_price_change'])
-
 target_cols = ['next_price_change', 'next_gap_filled', 'next_volume_pct_change', 'next_minutes_to_fill']
 feature_cols = ['Open', 'Close', 'High', 'Low', 'Gap', 'Gap_Pct', 'Daily_Volatility', 'Volume', 'Volume_Pct_Change', 'VIX_Close']
 X_numeric = ml_data[feature_cols].copy()
 X_day = pd.get_dummies(ml_data['Day_of_Week'], prefix='DOW')
 X = pd.concat([X_numeric, X_day], axis=1)
 y = ml_data[target_cols].copy()
-
 st.write("Shape of Feature Matrix (X):", X.shape)
 st.write("Shape of Target Matrix (y):", y.shape)
-
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 model = MultiOutputRegressor(RandomForestRegressor(n_estimators=100, random_state=42))
 model.fit(X_train, y_train)
@@ -297,172 +300,169 @@ predicted_metrics = {
     "Next Day Volume % Change": next_day_prediction[2],
     "Next Day Minutes to Fill": next_day_prediction[3]
 }
-
 st.subheader("Predicted Next Day Metrics (ML Model)")
 for metric, value in predicted_metrics.items():
     st.write(f"- **{metric}:** {value:.2f}")
 
-# -----------------------------------
-# 14. Option Chain CSV Upload
-# -----------------------------------
-st.subheader("Option Chain CSV Upload")
+# -------------------------------
+# 14. Option Chain CSV Upload (with Greeks)
+# -------------------------------
+st.subheader("Option Chain Upload")
 st.markdown("""
-Upload a CSV file containing your 0DTE option chain data (e.g. columns like Strike, Calls Bid, Calls Ask, Puts Bid, Puts Ask, etc.).
+Upload a CSV file containing your 0DTE option chain data, including columns for:
+- **Strike**
+- **Call Delta**, **Call Gamma**, **Call Theta**, **Call Vega**,
+- **Put Delta**, **Put Gamma**, **Put Theta**, **Put Vega**,
+- **(Optionally)** Call Bid, Call Ask, Put Bid, Put Ask, etc.
 """)
-
-uploaded_file = st.file_uploader("Upload your Option Chain CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload Option Chain CSV", type=["csv"])
 option_chain_df = None
 if uploaded_file is not None:
     option_chain_df = pd.read_csv(uploaded_file)
     st.write("Uploaded Option Chain Data (first 10 rows):")
     st.dataframe(option_chain_df.head(10))
 
-# -----------------------------------
-# 15. Automated 0DTE Option Strategy Recommendation (Using Option Chain)
-# -----------------------------------
-st.subheader("Automated 0DTE Option Strategy Recommendation")
+# -------------------------------
+# 15. AI-Generated Option Order Combination (Using Uploaded Greeks)
+# -------------------------------
+st.subheader("AI-Generated Option Order Combination")
 
-st.markdown("""
-Based on the ML-predicted gap fill probability and next day price change, 
-the system will automatically generate an optimal 0DTE vertical spread by looking up 
-strikes in your uploaded option chain. If no valid strikes are found, it returns 
-"No Trading Opportunities."
-""")
-
-min_gap_fill_prob = 0.80
-default_time_to_expiry_minutes = 30
-strike_offset = st.number_input("Strike Offset for Spread (USD)", value=5.0, step=0.5)
-contracts = st.number_input("Number of Contracts per Leg", value=1, min_value=1)
-
-underlying_price = float(spy['Close'].iloc[-1])
-predicted_price_change = predicted_metrics["Next Day Price Change (%)"]
-
-def black_scholes_greeks(S, K, T, r, sigma, option='call'):
-    d1 = (log(S / K) + (r + sigma**2 / 2) * T) / (sigma * sqrt(T))
-    d2 = d1 - sigma * sqrt(T)
-    if option == 'call':
-        price = S * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
-        delta = norm.cdf(d1)
-        theta = - (S * sigma * norm.pdf(d1)) / (2 * sqrt(T)) - r * K * exp(-r * T) * norm.cdf(d2)
+def generate_option_order_combination_with_uploaded_greeks(
+    predicted_metrics,
+    predicted_probability,
+    option_chain_df,
+    underlying_price,
+    risk_parameters
+):
+    """
+    Use the Assistants API to generate a JSON object for an optimal option order combination,
+    referencing the pre-computed Greeks in the uploaded CSV.
+    """
+    if option_chain_df is not None and 'Strike' in option_chain_df.columns:
+        available_strikes = option_chain_df['Strike'].dropna().unique().tolist()
+        available_strikes = [round(float(s), 2) for s in available_strikes]
     else:
-        price = K * exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-        delta = norm.cdf(d1) - 1
-        theta = - (S * sigma * norm.pdf(d1)) / (2 * sqrt(T)) + r * K * exp(-r * T) * norm.cdf(-d2)
-    gamma = norm.pdf(d1) / (S * sigma * sqrt(T))
-    vega = S * sqrt(T) * norm.pdf(d1)
-    return price, delta, gamma, theta, vega
-
-T_auto = default_time_to_expiry_minutes / (60 * 24 * 365)
-r_auto = 0.01
-sigma_auto = 0.20
-
-# Let user override if they want
-r_auto = st.number_input("Risk-Free Rate (Strategy)", value=0.01, step=0.001)
-sigma_auto = st.number_input("Implied Volatility (Strategy)", value=0.20, step=0.01)
-
-if predicted_probability is None or predicted_probability < min_gap_fill_prob:
-    st.error("No Trading Opportunities: Predicted gap fill probability is too low.")
-else:
-    # Determine direction
-    if predicted_price_change > 0:
-        strategy = "bullish"
-    elif predicted_price_change < 0:
-        strategy = "bearish"
-    else:
-        strategy = "neutral"
+        available_strikes = []
     
-    if strategy == "neutral":
-        st.error("No Trading Opportunities: Predicted price change is neutral.")
-    else:
-        if option_chain_df is None:
-            st.error("Please upload an option chain CSV first.")
-        else:
-            # Attempt to find an ATM strike
-            # e.g. we assume the chain has a 'Strike' column
-            option_chain_df['StrikeDiff'] = (option_chain_df['Strike'] - underlying_price).abs()
-            atm_row = option_chain_df.loc[option_chain_df['StrikeDiff'].idxmin()]
-            atm_strike = atm_row['Strike']
-            
-            if strategy == "bullish":
-                # Look for short strike = atm_strike + offset
-                short_strike_target = atm_strike + strike_offset
-            else:  # "bearish"
-                short_strike_target = atm_strike - strike_offset
-            
-            # find the row in the chain that's closest to short_strike_target
-            option_chain_df['OffsetDiff'] = (option_chain_df['Strike'] - short_strike_target).abs()
-            short_row = option_chain_df.loc[option_chain_df['OffsetDiff'].idxmin()]
-            short_strike = short_row['Strike']
-            
-            st.write(f"ATM Strike found: {atm_strike}, Short Strike found: {short_strike}")
-            
-            # If the short_strike is the same as atm_strike, might not be a valid offset
-            if abs(atm_strike - short_strike) < 0.5:
-                st.error("No Trading Opportunities: Could not find a valid offset strike in the chain.")
-            else:
-                # For demonstration, let's just do a quick black-scholes calc
-                # ignoring the actual bid/ask from the chain
-                if strategy == "bullish":
-                    long_option_type = "call"
-                    short_option_type = "call"
-                else:
-                    long_option_type = "put"
-                    short_option_type = "put"
-                
-                long_price, long_delta, long_gamma, long_theta, long_vega = black_scholes_greeks(
-                    underlying_price, atm_strike, T_auto, r_auto, sigma_auto, option=long_option_type)
-                short_price, short_delta, short_gamma, short_theta, short_vega = black_scholes_greeks(
-                    underlying_price, short_strike, T_auto, r_auto, sigma_auto, option=short_option_type)
-                
-                # Weighted by position
-                pos_factor_long = 1
-                pos_factor_short = -1
-                agg_delta = (long_delta * pos_factor_long * contracts) + (short_delta * pos_factor_short * contracts)
-                agg_gamma = (long_gamma * pos_factor_long * contracts) + (short_gamma * pos_factor_short * contracts)
-                agg_theta = (long_theta * pos_factor_long * contracts) + (short_theta * pos_factor_short * contracts)
-                agg_vega = (long_vega * pos_factor_long * contracts) + (short_vega * pos_factor_short * contracts)
-                net_premium = (long_price * contracts) - (short_price * contracts)
-                
-                st.write("### Generated Spread from Option Chain")
-                st.write(f"**Long Leg:** {long_option_type.capitalize()} at {atm_strike}, {contracts} contracts")
-                st.write(f"**Short Leg:** {short_option_type.capitalize()} at {short_strike}, {contracts} contracts")
-                st.write(f"**Net Premium (Cost):** {net_premium:.2f}")
-                st.write(f"**Aggregated Delta:** {agg_delta:.2f}")
-                st.write(f"**Aggregated Gamma:** {agg_gamma:.4f}")
-                st.write(f"**Aggregated Theta:** {agg_theta:.2f} per day")
-                st.write(f"**Aggregated Vega:** {agg_vega:.2f}")
-                
-                # Check viability
-                desired_net_delta_range = (-0.2, 0.2)
-                max_acceptable_net_theta = -10
-                if desired_net_delta_range[0] <= agg_delta <= desired_net_delta_range[1] and agg_theta > max_acceptable_net_theta:
-                    st.success("Recommended Trade: The automated 0DTE vertical spread meets risk-adjusted criteria.")
-                else:
-                    st.error("No Trading Opportunities: The aggregated Greeks do not meet the desired risk-adjusted criteria.")
+    preview_df = option_chain_df.head(5) if option_chain_df is not None else pd.DataFrame()
+    preview_json = preview_df.to_dict(orient="records")
+    
+    prompt = f"""
+You are an expert in selecting option combinations to maximize profit while limiting risk, based on predictions of price movement for the next day and an available 0DTE options chain.
 
-st.markdown("""
-**Note:** 
-- This approach uses the uploaded CSV to find an ATM strike and an offset strike. 
-- We still compute the Greeks with Black-Scholes for demonstration (ignoring the chain’s actual bid/ask). 
-- You can further refine this to use the chain’s bid/ask or actual IV for each strike to compute more accurate prices.
-""")
+Analyze the provided data to determine if there exists a viable option trade opportunity for tomorrow. The uploaded option chain represents the current available 0DTE options and includes pre-computed Greeks (e.g. 'Call Delta', 'Call Gamma', 'Call Theta', 'Call Vega', 'Put Delta', 'Put Gamma', 'Put Theta', 'Put Vega').
 
-# -----------------------------------
-# 16. AI-Generated Option Strategy Recommendation
-# -----------------------------------
-st.subheader("AI-Generated Option Strategy Recommendation")
+Input Data:
+- Current Underlying Price: {underlying_price:.2f}
+- ML-Predicted Next Day Metrics: {predicted_metrics}
+- Predicted Gap Fill Probability: {predicted_probability:.0%}
+- Risk Criteria: {risk_parameters}
+- Available Strikes: {available_strikes}
+- Option Chain Sample (first 5 rows): {json.dumps(preview_json, indent=2)}
 
-# Define risk parameters (you can adjust these)
-risk_parameters = {
-    "Desired Net Delta Range": "(-0.2, 0.2)",
-    "Max Acceptable Theta": "-10 per day"
-}
+Determine if there is a profitable, risk-managed opportunity. If so, return only a valid JSON object exactly conforming to this schema:
 
-# Call the OpenAI API to generate the strategy
+{{
+  "strike_price": number,
+  "delta": number,
+  "stop_loss": number,
+  "take_profit": number,
+  "limit_price": number,
+  "type": "Put" or "Call",
+  "estimated_profit": number,
+  "possible_loss": number,
+  "probability_of_success": number
+}}
+
+If no viable opportunity exists, return a JSON object with all values as "n/a". Do not output any extra text.
+"""
+    payload = {
+        "assistant_id": "asst_umHbxf54jQ5W5up0oRFTlibH",
+        "thread": {
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        },
+        "response_format": "auto",
+        "temperature": 0.2,
+        "max_completion_tokens": 300
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {openai.api_key}",
+        "OpenAI-Beta": "assistants=v2"
+    }
+    
+    run_url = "https://api.openai.com/v1/threads/runs"
+    run_response = requests.post(run_url, headers=headers, json=payload)
+    if run_response.status_code != 200:
+        return f"Error creating run: {run_response.text}"
+    run_data = run_response.json()
+    run_id = run_data["id"]
+    thread_id = run_data["thread_id"]
+    
+    polling_status = st.empty()
+    run_status = run_data.get("status")
+    timeout = 90
+    start_time = time.time()
+    while run_status not in ["completed", "failed"]:
+        polling_status.info(f"Waiting for assistant run to complete... (Status: {run_status})")
+        time.sleep(2)
+        poll_url = f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}"
+        poll_response = requests.get(poll_url, headers=headers)
+        if poll_response.status_code != 200:
+            return f"Error polling run: {poll_response.text}"
+        run_data = poll_response.json()
+        run_status = run_data.get("status")
+        if time.time() - start_time > timeout:
+            polling_status.info("Polling timed out; retrieving messages anyway.")
+            break
+    
+    polling_status.info("Assistant run completed. Retrieving messages...")
+    messages_url = f"https://api.openai.com/v1/threads/{thread_id}/messages"
+    messages_response = requests.get(messages_url, headers=headers)
+    if messages_response.status_code != 200:
+        return f"Error retrieving messages: {messages_response.text}"
+    messages_data = messages_response.json().get("data", [])
+    # Check for messages with role "assistant" or "function"
+    assistant_messages = [m for m in messages_data if m.get("role") in ["assistant", "function"]]
+    if not assistant_messages:
+        return {"strike_price": "n/a", "delta": "n/a", "stop_loss": "n/a", "take_profit": "n/a", "limit_price": "n/a", "type": "n/a", "estimated_profit": "n/a", "possible_loss": "n/a", "probability_of_success": "n/a"}
+    last_message = assistant_messages[-1]
+    try:
+        output_text = last_message["content"][0]["text"]["value"].strip()
+        if not output_text:
+            fallback = {"strike_price": "n/a", "delta": "n/a", "stop_loss": "n/a", "take_profit": "n/a", "limit_price": "n/a", "type": "n/a", "estimated_profit": "n/a", "possible_loss": "n/a", "probability_of_success": "n/a"}
+            return fallback
+        result = json.loads(output_text)
+        if not result:
+            fallback = {"strike_price": "n/a", "delta": "n/a", "stop_loss": "n/a", "take_profit": "n/a", "limit_price": "n/a", "type": "n/a", "estimated_profit": "n/a", "possible_loss": "n/a", "probability_of_success": "n/a"}
+            return fallback
+        return result
+    except Exception:
+        fallback = {"strike_price": "n/a", "delta": "n/a", "stop_loss": "n/a", "take_profit": "n/a", "limit_price": "n/a", "type": "n/a", "estimated_profit": "n/a", "possible_loss": "n/a", "probability_of_success": "n/a"}
+        return fallback
+
 if option_chain_df is not None:
-    ai_strategy = generate_option_strategy(predicted_metrics, predicted_probability, option_chain_df, float(spy['Close'].iloc[-1]), risk_parameters)
-    st.markdown("### Recommended Strategy:")
-    st.write(ai_strategy)
+    risk_parameters = {
+        "Desired Net Delta Range": "(-0.2, 0.2)",
+        "Max Acceptable Theta": "-10 per day"
+    }
+    underlying_price = float(data['Close'].iloc[-1])
+    ai_output = generate_option_order_combination_with_uploaded_greeks(
+        predicted_metrics=predicted_metrics,
+        predicted_probability=predicted_probability if predicted_probability else 0.0,
+        option_chain_df=option_chain_df,
+        underlying_price=underlying_price,
+        risk_parameters=risk_parameters
+    )
+    st.subheader("Option Order Combination (AI Output)")
+    if isinstance(ai_output, dict):
+        df_orders = pd.DataFrame([ai_output])
+        st.dataframe(df_orders)
+    else:
+        st.write(ai_output)
 else:
-    st.info("Please upload an option chain CSV to generate an AI strategy recommendation.")
+    st.info("Please upload an option chain CSV (with Greeks) to generate an AI strategy recommendation.")
+
 
