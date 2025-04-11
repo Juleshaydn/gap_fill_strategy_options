@@ -37,9 +37,8 @@ st.markdown("""
 This dashboard allows you to select a lookback period and an asset (Apple, Amazon, SPY, Google, Tesla, or Bitcoin).
 """)
 
-# -------------------------------
+
 # Asset Selection
-# -------------------------------
 asset_options = {
     "Apple": "AAPL",
     "Amazon": "AMZN",
@@ -52,9 +51,8 @@ asset_choice = st.selectbox("Choose Asset", list(asset_options.keys()), index=2)
 ticker_symbol = asset_options[asset_choice]
 st.write(f"**Selected Asset:** {asset_choice} ({ticker_symbol})")
 
-# -------------------------------
-# 1. User Input for Lookback Period
-# -------------------------------
+
+# User Input for Lookback Period
 period_choice = st.selectbox(
     "Choose Lookback Period",
     ["7d", "14d", "1mo", "3mo", "6mo", "1y"],
@@ -74,9 +72,8 @@ def choose_interval(period):
 interval_choice = choose_interval(period_choice)
 st.write(f"**Selected Period:** {period_choice}, **Interval:** {interval_choice}")
 
-# -------------------------------
-# 2. Data Download and Preparation
-# -------------------------------
+
+# Data Download and Preparation
 @st.cache_data(show_spinner=True)
 def load_data(ticker, period, interval):
     data = yf.download(ticker, period=period, interval=interval, auto_adjust=True)
@@ -91,9 +88,8 @@ if data.empty:
 data.index = pd.to_datetime(data.index)
 data['Date'] = data.index.date
 
-# -------------------------------
-# 3. Create Daily Summary (including Volume)
-# -------------------------------
+
+# Create Daily Summary (including Volume)
 daily_summary = data.groupby('Date').agg({
     'Open': 'first',
     'Close': 'last',
@@ -110,9 +106,8 @@ daily_summary.dropna(inplace=True)
 daily_summary['Day_of_Week'] = pd.to_datetime(daily_summary.index).day_name()
 daily_summary['Daily_Volatility'] = (daily_summary['High'] - daily_summary['Open']) / daily_summary['Open'] * 100
 
-# -------------------------------
-# 4. Download VIX Daily Data for the same date range
-# -------------------------------
+
+# Download VIX Daily Data for the same date range
 start_date = daily_summary.index.min().strftime("%Y-%m-%d")
 end_date = daily_summary.index.max().strftime("%Y-%m-%d")
 vix = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
@@ -121,16 +116,14 @@ vix_daily = vix[['Close']].rename(columns={'Close': 'VIX_Close'})
 vix_daily.index = vix_daily.index.date
 daily_summary = daily_summary.merge(vix_daily, left_index=True, right_index=True, how='left')
 
-# -------------------------------
-# 5. Additional Column: Gap Type
-# -------------------------------
+
+# Additional Column: Gap Type
 def classify_gap(gap_pct):
     return "Small Gap" if abs(gap_pct) <= 1 else "Large Gap"
 daily_summary['Gap_Type'] = daily_summary['Gap_Pct'].apply(classify_gap)
 
-# -------------------------------
-# 6. Intraday Gap Fill Analysis
-# -------------------------------
+
+# Intraday Gap Fill Analysis
 gap_fill_data = []
 for date in daily_summary.index:
     day_data = data[data['Date'] == date]
@@ -160,26 +153,22 @@ gap_fill_df = pd.DataFrame(gap_fill_data).set_index('Date')
 daily_summary = daily_summary.merge(gap_fill_df, left_index=True, right_index=True, how='left')
 daily_summary['Filled'] = daily_summary['Filled'].fillna(False)
 
-# -------------------------------
-# 7. Historical Fill Probability (by Day of Week)
-# -------------------------------
+
+# Historical Fill Probability (by Day of Week)
 fill_prob = daily_summary.groupby('Day_of_Week')['Filled'].mean()
 days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 fill_prob = fill_prob.reindex(days_order)
 fill_prob_mapping = fill_prob.to_dict()
 daily_summary['Historical_Fill_Probability'] = daily_summary['Day_of_Week'].map(fill_prob_mapping)
 
-# -------------------------------
-# 8. Historical Volume Metrics (by Day of Week)
-# -------------------------------
+
+# Historical Volume Metrics (by Day of Week)
 grouped_volume = daily_summary.groupby('Day_of_Week')['Volume'].mean()
 grouped_volume_pct = daily_summary.groupby('Day_of_Week')['Volume_Pct_Change'].mean()
 daily_summary['Historical_Avg_Volume'] = daily_summary['Day_of_Week'].map(grouped_volume.to_dict())
 daily_summary['Historical_Avg_Volume_Pct_Change'] = daily_summary['Day_of_Week'].map(grouped_volume_pct.to_dict())
 
-# -------------------------------
-# 9. Market Sentiment Column (dummy Economic_Event data)
-# -------------------------------
+# Market Sentiment Column (dummy Economic_Event data)
 dummy_events = {
     daily_summary.index[0]: "Positive earnings surprise",
     daily_summary.index[1]: "Slightly negative macro report",
@@ -204,9 +193,8 @@ def sentiment_score(event):
         return 0
 daily_summary['Market_Sentiment'] = daily_summary['Economic_Event'].apply(sentiment_score)
 
-# -------------------------------
-# 10. Consolidated Daily Summary Display
-# -------------------------------
+
+# Consolidated Daily Summary Display
 final_columns = [
     'Open', 'Close', 'High', 'Low', 'Prev_Close', 'Gap', 'Gap_Pct', 
     'Day_of_Week', 'Daily_Volatility', 'Gap_Type', 'Economic_Event', 
@@ -218,9 +206,8 @@ daily_summary = daily_summary[final_columns]
 st.subheader("Consolidated Daily Summary with Metrics")
 st.dataframe(daily_summary)
 
-# -------------------------------
-# 11. Correlation: Day of Week vs. Gap Fill Probability Heatmap
-# -------------------------------
+
+# Correlation: Day of Week vs. Gap Fill Probability Heatmap
 st.subheader("Gap Fill Probability by Day of Week (Historical)")
 day_prob_df = pd.DataFrame({'Fill_Probability': fill_prob})
 fig2, ax2 = plt.subplots(figsize=(6, 2))
@@ -228,9 +215,8 @@ sns.heatmap(day_prob_df.T, annot=True, cmap='YlGnBu', vmin=0, vmax=1, ax=ax2)
 ax2.set_title("Gap Fill Probability by Day of Week")
 st.pyplot(fig2)
 
-# -------------------------------
-# 12. Next Day Prediction Section (including Volume Metrics)
-# -------------------------------
+
+# Next Day Prediction Section (including Volume Metrics)
 last_date = pd.to_datetime(daily_summary.index.max())
 next_trading_day = (last_date + BDay(1)).date()
 next_day_name = pd.to_datetime(next_trading_day).day_name()
@@ -251,9 +237,8 @@ if predicted_probability is not None:
 else:
     st.write("Not enough historical data to predict next day's metrics.")
 
-# -------------------------------
-# 13. Machine Learning Model for Next Day Metrics Prediction
-# -------------------------------
+
+# Machine Learning Model for Next Day Metrics Prediction
 st.subheader("ML Next Day Predictions")
 ml_data = daily_summary.sort_index().copy()
 ml_data['Filled'] = ml_data['Filled'].fillna(False)

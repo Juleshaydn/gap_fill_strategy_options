@@ -1,3 +1,6 @@
+<!-- Install Dependancies -->
+pip install -r requirements.txt
+
 <!-- Run Streamlit Dashboard -->
 streamlit run main.py
 
